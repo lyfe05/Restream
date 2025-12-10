@@ -1,11 +1,9 @@
-// /api/stream.js
-
 export default async function handler(req, res) {
   try {
     const target = req.query.url;
     const token = req.query.token;
 
-    // --- Optional Security (bearer token style) ---
+    // --- Simple security ---
     const SERVER_TOKEN = process.env.SERVER_TOKEN || "mysecret";
     if (token !== SERVER_TOKEN) {
       return res.status(403).send("Forbidden");
@@ -27,7 +25,7 @@ export default async function handler(req, res) {
 
     let text = await response.text();
 
-    // --- Fix relative TS segments to absolute
+    // Fix .ts segments to absolute links
     const base = target.split("/").slice(0, -1).join("/");
     text = text.replace(/^(?!https?:\/\/)(.*\.ts)$/gm, `${base}/$1`);
 
