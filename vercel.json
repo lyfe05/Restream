@@ -1,5 +1,4 @@
 {
-  "runtime": "nodejs20.x",
   "regions": ["fra1"],
   "functions": {
     "api/stream.js": {
