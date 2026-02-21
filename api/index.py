@@ -2,80 +2,122 @@ from flask import Flask, request, Response
 from flask_cors import CORS
 import requests
 import re
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, unquote
+import traceback
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Enable CORS for all routes
+CORS(app)
 
 HEADERS = {
     "Referer": "https://streameeeeee.site/",
     "Origin": "https://streameeeeee.site",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "*/*"
 }
 
 @app.route('/')
 def proxy():
-    url = request.args.get('url')
-    if not url:
+    target_url = request.args.get('url')
+    if not target_url:
         return "Missing ?url= parameter", 400
     
     try:
-        # Fetch from upstream
-        resp = requests.get(url, headers=HEADERS, timeout=30, stream=True)
+        # Decode URL if it's encoded
+        target_url = unquote(target_url)
+        
+        # Fetch upstream (disable SSL verify for weird ports/servers)
+        resp = requests.get(
+            target_url, 
+            headers=HEADERS, 
+            timeout=30, 
+            stream=True,
+            verify=False  # Disable SSL verification for problematic servers
+        )
         resp.raise_for_status()
         
-        content_type = resp.headers.get('Content-Type', '')
+        content_type = resp.headers.get('Content-Type', '').lower()
         
-        # Check if M3U8 playlist
-        is_m3u8 = ('mpegurl' in content_type or 
-                   url.endswith('.m3u8') or 
-                   url.endswith('.m3u'))
+        # Check if M3U8
+        is_m3u8 = (
+            'mpegurl' in content_type or 
+            'm3u8' in content_type or
+            target_url.endswith('.m3u8') or 
+            target_url.endswith('.m3u')
+        )
         
         if is_m3u8:
+            # Read text content
             text = resp.text
-            base = url.rsplit('/', 1)[0] + '/'
-            proxy_base = request.base_url  # e.g., http://localhost:8000/
+            
+            # Build proxy base URL (scheme + host + /)
+            proxy_base = f"{request.scheme}://{request.host}/"
+            
+            # Get base path for resolving relative URLs
+            base_path = target_url.rsplit('/', 1)[0] + '/'
             
             lines = []
             for line in text.splitlines():
                 stripped = line.strip()
                 
-                # Keep comments but rewrite URIs inside them
+                # Handle HLS tags with URIs
                 if stripped.startswith('#'):
-                    if 'URI="' in line:
-                        line = re.sub(
-                            r'URI="([^"]+)"',
-                            lambda m: f'URI="{proxy_base}?url={quote(urljoin(base, m.group(1)) if not m.group(1).startswith("http") else m.group(1), safe="")}"',
-                            line
-                        )
+                    if 'URI="' in stripped:
+                        def replace_uri(match):
+                            uri = match.group(1)
+                            if uri.startswith('http'):
+                                abs_uri = uri
+                            else:
+                                abs_uri = urljoin(base_path, uri)
+                            return f'URI="{proxy_base}?url={quote(abs_uri, safe="")}"'
+                        
+                        line = re.sub(r'URI="([^"]+)"', replace_uri, line)
                     lines.append(line)
+                
+                # Empty lines
                 elif not stripped:
                     lines.append(line)
+                
+                # Media lines (URLs)
                 else:
-                    # Media segment or sub-playlist URL
                     if stripped.startswith('http'):
                         abs_url = stripped
                     else:
-                        abs_url = urljoin(base, stripped)
+                        abs_url = urljoin(base_path, stripped)
                     
-                    # Rewrite to use this proxy
+                    # Rewrite to proxy
                     proxy_url = f"{proxy_base}?url={quote(abs_url, safe='')}"
                     lines.append(proxy_url)
             
-            body = '\n'.join(lines)
-            return Response(body, mimetype='application/vnd.apple.mpegurl')
+            output = '\n'.join(lines)
+            
+            return Response(
+                output,
+                mimetype='application/vnd.apple.mpegurl',
+                headers={'Cache-Control': 'no-cache'}
+            )
         
         else:
-            # Binary content (video segments) - stream it
+            # Binary stream (video segments)
             def generate():
                 for chunk in resp.iter_content(chunk_size=8192):
-                    yield chunk
+                    if chunk:
+                        yield chunk
             
-            return Response(generate(), mimetype=content_type)
+            return Response(
+                generate(),
+                mimetype=content_type or 'video/MP2T',
+                direct_passthrough=True
+            )
             
     except Exception as e:
-        return f"Proxy error: {str(e)}", 500
+        # Return detailed error for debugging
+        error_msg = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        print(error_msg)  # Log to console
+        return error_msg, 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, threaded=True)
+    # Disable SSL warnings
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    app.run(host='0.0.0.0', port=8000, threaded=True, debug=True)
