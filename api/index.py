@@ -8,11 +8,18 @@ import traceback
 app = Flask(__name__)
 CORS(app)
 
+# EXACT headers from your JSON (preserve the trailing spaces!)
 HEADERS = {
-    "Referer": "https://streameeeeee.site/",
-    "Origin": "https://streameeeeee.site",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "*/*"
+    "Referer": "https://streameeeeee.site/ ",  # Note the space at end
+    "Origin": "https://streameeeeee.site ",    # Note the space at end
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",  # No compression
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site"
 }
 
 @app.route('/')
@@ -22,17 +29,47 @@ def proxy():
         return "Missing ?url= parameter", 400
     
     try:
-        # Decode URL if it's encoded
-        target_url = unquote(target_url)
+        # Decode if double-encoded
+        if '%' in target_url:
+            try:
+                target_url = unquote(target_url)
+            except:
+                pass
         
-        # Fetch upstream (disable SSL verify for weird ports/servers)
-        resp = requests.get(
+        # Create session to handle cookies/redirects better
+        session = requests.Session()
+        
+        # Fetch upstream
+        resp = session.get(
             target_url, 
             headers=HEADERS, 
             timeout=30, 
             stream=True,
-            verify=False  # Disable SSL verification for problematic servers
+            verify=False,
+            allow_redirects=True
         )
+        
+        # Debug: Print what we got
+        print(f"URL: {target_url}")
+        print(f"Status: {resp.status_code}")
+        print(f"Response headers: {dict(resp.headers)}")
+        
+        if resp.status_code == 403:
+            # Return debug info to see what's happening
+            return f"""
+            403 Forbidden - CDN blocked request.
+            
+            URL attempted: {target_url}
+            Headers sent: {HEADERS}
+            
+            Response headers: {dict(resp.headers)}
+            
+            Possible causes:
+            1. Token expired (URLs are time-limited)
+            2. IP-locked token (token was generated for different IP)
+            3. Missing cookies/session
+            """, 403
+        
         resp.raise_for_status()
         
         content_type = resp.headers.get('Content-Type', '').lower()
@@ -46,20 +83,19 @@ def proxy():
         )
         
         if is_m3u8:
-            # Read text content
             text = resp.text
             
-            # Build proxy base URL (scheme + host + /)
-            proxy_base = f"{request.scheme}://{request.host}/"
+            # Build proxy base URL
+            scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+            host = request.headers.get('X-Forwarded-Host', request.host)
+            proxy_base = f"{scheme}://{host}/"
             
-            # Get base path for resolving relative URLs
             base_path = target_url.rsplit('/', 1)[0] + '/'
             
             lines = []
             for line in text.splitlines():
                 stripped = line.strip()
                 
-                # Handle HLS tags with URIs
                 if stripped.startswith('#'):
                     if 'URI="' in stripped:
                         def replace_uri(match):
@@ -73,18 +109,15 @@ def proxy():
                         line = re.sub(r'URI="([^"]+)"', replace_uri, line)
                     lines.append(line)
                 
-                # Empty lines
                 elif not stripped:
                     lines.append(line)
                 
-                # Media lines (URLs)
                 else:
                     if stripped.startswith('http'):
                         abs_url = stripped
                     else:
                         abs_url = urljoin(base_path, stripped)
                     
-                    # Rewrite to proxy
                     proxy_url = f"{proxy_base}?url={quote(abs_url, safe='')}"
                     lines.append(proxy_url)
             
@@ -97,9 +130,9 @@ def proxy():
             )
         
         else:
-            # Binary stream (video segments)
+            # Binary stream
             def generate():
-                for chunk in resp.iter_content(chunk_size=8192):
+                for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
                         yield chunk
             
@@ -110,14 +143,11 @@ def proxy():
             )
             
     except Exception as e:
-        # Return detailed error for debugging
         error_msg = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-        print(error_msg)  # Log to console
+        print(error_msg)
         return error_msg, 500
 
 if __name__ == '__main__':
-    # Disable SSL warnings
     import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    
+    urllib3.disable_warnings()
     app.run(host='0.0.0.0', port=8000, threaded=True, debug=True)
